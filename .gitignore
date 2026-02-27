@@ -169,3 +169,6 @@ chronos-2-finetuned
 
 # Kiro IDE
 .kiro
+
+# chronos-forecasting
+figures/
