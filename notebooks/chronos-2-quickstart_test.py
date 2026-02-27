@@ -449,7 +449,7 @@ if __name__ == "__main__":
 
     # Univeriate forecasting on M4 dataset
     # -------------------------------------
-    m4_dataset_forecasting(pipeline)
+    context_df = m4_dataset_forecasting(pipeline)
 
     # Forecasting with covariates on energy price dataset
     # ---------------------------------------------------
@@ -458,5 +458,9 @@ if __name__ == "__main__":
     # Forecasting with covariates on retail demand dataset
     # ------------------------------------------------------
     retail_demand_forecasting(pipeline)
+
+    # Test cross-learning covariates API
+    # ----------------------------------
+    cross_learning_covariates_api(pipeline, context_df)
 
 # [EOF]
