@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, Mapping, Sequence
 
 import numpy as np
+import pandas as pd
 import torch
 from einops import rearrange, repeat
+from packaging import version
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
 from transformers.utils.import_utils import is_peft_available
@@ -22,14 +24,15 @@ from transformers.utils.peft_utils import find_adapter_config_file
 import chronos.chronos2
 from chronos.base import BaseChronosPipeline, ForecastType
 from chronos.chronos2 import Chronos2Model
-from chronos.chronos2.dataset import Chronos2Dataset, DatasetMode, TensorOrArray
-from chronos.df_utils import convert_df_input_to_list_of_dicts_input
+from chronos.chronos2.dataset import Chronos2Dataset, DatasetMode, PreparedInput, TensorOrArray
+from chronos.chronos2.model import _TRANSFORMERS_V5
+from chronos.chronos2.preprocess import from_data_frame
+from chronos.df_utils import make_future_df, validate_and_normalize_df
 from chronos.utils import interpolate_quantiles, weighted_quantile
 
 if TYPE_CHECKING:
     import datasets
     import fev
-    import pandas as pd
     from peft import LoraConfig
     from transformers.trainer_callback import TrainerCallback
 
@@ -97,11 +100,13 @@ class Chronos2Pipeline(BaseChronosPipeline):
         self,
         inputs: TensorOrArray
         | Sequence[TensorOrArray]
-        | Sequence[Mapping[str, TensorOrArray | Mapping[str, TensorOrArray | None]]],
+        | Sequence[Mapping[str, TensorOrArray | Mapping[str, TensorOrArray | None]]]
+        | Sequence[PreparedInput],
         prediction_length: int,
         validation_inputs: TensorOrArray
         | Sequence[TensorOrArray]
         | Sequence[Mapping[str, TensorOrArray | Mapping[str, TensorOrArray | None]]]
+        | Sequence[PreparedInput]
         | None = None,
         finetune_mode: Literal["full", "lora"] = "full",
         lora_config: "LoraConfig | dict | None" = None,
@@ -124,9 +129,9 @@ class Chronos2Pipeline(BaseChronosPipeline):
         ----------
         inputs
             The time series on which the model will be fine-tuned. The allowed formats of inputs are the same as `Chronos2Pipeline.predict()`.
-            Note: when `inputs` is a list of dicts, the values inside `future_covariates` are not technically used for training the model;
-            however, this key is used to infer which covariates are known into the future. Therefore, if your task contains known future covariates,
-            make sure that this key exists in `inputs`. The values of individual future covariates may be set to `None` or an empty array.
+            When fine-tuning with covariates, we recommend building the inputs with the `chronos.chronos2.preprocess` helpers, which handle
+            covariates (including which are known into the future) and categorical encoding for you: `from_data_frame` (long-format DataFrame)
+            and `from_list_of_dicts` (list of per-series dicts).
         prediction_length
             The prediction horizon for which the model will be fine-tuned
         validation_inputs
@@ -229,7 +234,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
         if min_past is None:
             min_past = prediction_length
 
-        train_dataset = Chronos2Dataset.convert_inputs(
+        train_dataset = Chronos2Dataset(
             inputs=inputs,
             context_length=context_length,
             prediction_length=prediction_length,
@@ -264,7 +269,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             per_device_eval_batch_size=batch_size,
             learning_rate=learning_rate,
             lr_scheduler_type="linear",
-            warmup_ratio=0.0,
+            **({"warmup_steps": 0} if _TRANSFORMERS_V5 else {"warmup_ratio": 0.0}),
             optim="adamw_torch_fused",
             logging_strategy="steps",
             logging_steps=100,
@@ -290,8 +295,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
         eval_dataset = None
         callbacks = callbacks or []
         if validation_inputs is not None:
-            # construct validation dataset
-            eval_dataset = Chronos2Dataset.convert_inputs(
+            eval_dataset = Chronos2Dataset(
                 inputs=validation_inputs,
                 context_length=context_length,
                 prediction_length=prediction_length,
@@ -317,8 +321,17 @@ class Chronos2Pipeline(BaseChronosPipeline):
         if training_kwargs["tf32"]:
             # setting tf32=True changes these global properties, we copy them here so that
             # we can restore them after fine-tuning
-            matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
-            cudnn_tf32 = torch.backends.cudnn.allow_tf32
+
+            # NOTE: The old way of allowing TF32 computations was deprecated in 2.9 and torch
+            # doesn't allow mixing the old and new ways.
+            is_torch_geq_2p9 = version.parse(torch.__version__) >= version.parse("2.9.0")
+
+            if is_torch_geq_2p9:
+                matmul_precision = torch.backends.cuda.matmul.fp32_precision
+                cudnn_precision = torch.backends.cudnn.fp32_precision
+            else:
+                matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+                cudnn_tf32 = torch.backends.cudnn.allow_tf32
 
         training_args = TrainingArguments(**training_kwargs)
 
@@ -358,8 +371,13 @@ class Chronos2Pipeline(BaseChronosPipeline):
 
         if training_kwargs["tf32"]:
             # restore tf32 settings
-            torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
-            torch.backends.cudnn.allow_tf32 = cudnn_tf32
+
+            if is_torch_geq_2p9:
+                torch.backends.cuda.matmul.fp32_precision = matmul_precision
+                torch.backends.cudnn.fp32_precision = cudnn_precision
+            else:
+                torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+                torch.backends.cudnn.allow_tf32 = cudnn_tf32
 
         return finetuned_pipeline
 
@@ -451,7 +469,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
         self,
         inputs: TensorOrArray
         | Sequence[TensorOrArray]
-        | Sequence[Mapping[str, TensorOrArray | Mapping[str, TensorOrArray]]],
+        | Sequence[Mapping[str, TensorOrArray | Mapping[str, TensorOrArray]]]
+        | Sequence[PreparedInput],
         prediction_length: int | None = None,
         batch_size: int = 256,
         context_length: int | None = None,
@@ -482,6 +501,10 @@ class Chronos2Pipeline(BaseChronosPipeline):
                 covariates and values must be 1-d `torch.Tensor` or `np.ndarray` with length equal to the `prediction_length`. All keys in
                 `future_covariates` must be a subset of the keys in `past_covariates`.
 
+              All dictionaries in the list must share the same schema: the same `target` shape (`n_variates`) and the same
+              `past_covariates` / `future_covariates` keys (the `history_length` may differ across dictionaries). To forecast
+              inputs with different schemas, loop over them and call the model once per schema.
+
             Examples:
             ```python
 
@@ -491,46 +514,29 @@ class Chronos2Pipeline(BaseChronosPipeline):
             # Batch of multivariate time series
             inputs = torch.randn(32, 3, 100)
 
-            # List of time series with different lengths and n_variates
+            # List of univariate time series with different lengths
             inputs = [
-                torch.randn(100),  # univariate series of length 100
-                torch.randn(2, 150),  # bivariate series of length 150
-                torch.randn(120),  # univariate series of length 120
+                torch.randn(100),
+                torch.randn(150),
+                torch.randn(120),
             ]
 
-            # List of dictionaries with covariates
+            # List of dictionaries with covariates (one numeric and one categorical covariate known into the future).
+            # Note: categorical covariates are only supported as numpy arrays as torch does not support str dtype.
             prediction_length = 24
             inputs = [
                 {
-                    # task with 1-d target, one past-only covariate and one known future covariate
-                    "target": torch.randn(100),
-                    "past_covariates": {"temperature": torch.randn(100), "precipitation": torch.randn(100)},
-                    "future_covariates": {"temperature": torch.randn(prediction_length)},
-                },
-                {
-                    # task with 2-d target and one past-only covariate
-                    "target": torch.randn(2, 150),
-                    "past_covariates": {"wind_speed": torch.randn(150)},
-                },
-                {
-                    # task with 1-d target, two numeric covariates one of which is known into the future
-                    # and one categorical covariate known into the future
-                    # Note: categorical covariates are only supported as numpy arrays as torch does not support str dtype
-                    "target": np.random.randn(150),
+                    "target": np.random.randn(history_length),
                     "past_covariates": {
-                        "numeric_covariate_1": np.random.rand(150),
-                        "numeric_covariate_2": np.random.rand(150),
-                        "cat_covariate": np.random.choice(["A", "B", "C", "D", "E"], size=150),
+                        "temperature": np.random.rand(history_length),
+                        "weather_type": np.random.choice(["sunny", "cloudy", "rainy"], size=history_length),
                     },
                     "future_covariates": {
-                        "numeric_covariate_1": np.random.rand(prediction_length),
-                        "cat_covariate": np.random.choice(["A", "B", "C", "D", "E"], size=prediction_length),
+                        "temperature": np.random.rand(prediction_length),
+                        "weather_type": np.random.choice(["sunny", "cloudy", "rainy"], size=prediction_length),
                     },
-                },
-                {
-                    # task with only a 1-d target
-                    "target": torch.randn(1, 150)
-                },
+                }
+                for history_length in [100, 150, 120]
             ]
             ```
         prediction_length
@@ -610,8 +616,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
             )
             context_length = self.model_context_length
 
-        test_dataset = Chronos2Dataset.convert_inputs(
-            inputs=inputs,
+        test_dataset = Chronos2Dataset(
+            inputs,
             context_length=context_length,
             prediction_length=prediction_length,
             batch_size=batch_size,
@@ -758,7 +764,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
         self,
         inputs: TensorOrArray
         | Sequence[TensorOrArray]
-        | Sequence[Mapping[str, TensorOrArray | Mapping[str, TensorOrArray]]],
+        | Sequence[Mapping[str, TensorOrArray | Mapping[str, TensorOrArray]]]
+        | Sequence[PreparedInput],
         prediction_length: int | None = None,
         quantile_levels: list[float] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
         **predict_kwargs,
@@ -814,8 +821,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
 
     def predict_df(
         self,
-        df: "pd.DataFrame",
-        future_df: "pd.DataFrame | None" = None,
+        df: pd.DataFrame,
+        future_df: pd.DataFrame | None = None,
         id_column: str = "item_id",
         timestamp_column: str = "timestamp",
         target: str | list[str] = "target",
@@ -827,7 +834,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
         validate_inputs: bool = True,
         freq: str | None = None,
         **predict_kwargs,
-    ) -> "pd.DataFrame":
+    ) -> pd.DataFrame:
         """
         Perform forecasting on time series data in a long-format pandas DataFrame.
 
@@ -871,8 +878,10 @@ class Chronos2Pipeline(BaseChronosPipeline):
             has the same item IDs as df with exactly prediction_length rows of future timestamps per item; (3) all
             timestamps are regularly spaced (e.g., with hourly frequency).
         freq
-            Frequency string for timestamp generation (e.g., "h", "D", "W"). Can only be used when
-            validate_inputs=False. When provided, skips frequency inference from the data.
+            Frequency string for timestamp generation (e.g., "h", "D", "W"). When provided, skips
+            frequency inference from the data and uses this frequency to generate the forecast timestamps.
+            Note: the provided `freq` is used as-is and is not checked against the data, even when
+            validate_inputs=True.
         **predict_kwargs
             Additional arguments passed to predict_quantiles
 
@@ -885,31 +894,46 @@ class Chronos2Pipeline(BaseChronosPipeline):
         - "predictions": The point predictions generated by the model
         - One column for predictions at each quantile level in `quantile_levels`
         """
-        try:
-            import pandas as pd
-        except ImportError:
-            raise ImportError("pandas is required for predict_df. Please install it with `pip install pandas`.")
-
         if prediction_length is None:
             prediction_length = self.model_prediction_length
 
         if not isinstance(target, list):
             target = [target]
 
-        inputs, original_order, prediction_timestamps = convert_df_input_to_list_of_dicts_input(
-            df=df,
+        if validate_inputs:
+            df, future_df = validate_and_normalize_df(
+                df=df,
+                future_df=future_df,
+                target_columns=target,
+                prediction_length=prediction_length,
+                id_column=id_column,
+                timestamp_column=timestamp_column,
+            )
+
+        # df/future_df are already validated and normalized above, so skip re-doing it inside from_data_frame.
+        prepared = from_data_frame(
+            df,
+            target_columns=target,
+            prediction_length=prediction_length,
             future_df=future_df,
             id_column=id_column,
             timestamp_column=timestamp_column,
-            target_columns=target,
-            prediction_length=prediction_length,
-            freq=freq,
-            validate_inputs=validate_inputs,
+            validate_inputs=False,
         )
+
+        future = make_future_df(
+            df, prediction_length, freq=freq, id_column=id_column, timestamp_column=timestamp_column
+        )
+        if validate_inputs and future_df is not None:
+            if (pd.DatetimeIndex(future_df[timestamp_column]) != pd.DatetimeIndex(future[timestamp_column])).any():
+                raise ValueError(
+                    "future_df timestamps do not match the expected prediction timestamps. "
+                    "You can disable this check by setting `validate_inputs=False`"
+                )
 
         # Generate forecasts
         quantiles, mean = self.predict_quantiles(
-            inputs=inputs,
+            inputs=prepared,
             prediction_length=prediction_length,
             quantile_levels=quantile_levels,
             limit_prediction_length=False,
@@ -918,105 +942,24 @@ class Chronos2Pipeline(BaseChronosPipeline):
             cross_learning=cross_learning,
             **predict_kwargs,
         )
-        # since predict_df tasks are homogenous by input design, we can safely stack the list of tensors into a single tensor
         quantiles_np = torch.stack(quantiles).numpy()  # [n_tasks, n_variates, horizon, num_quantiles]
         mean_np = torch.stack(mean).numpy()  # [n_tasks, n_variates, horizon]
 
-        n_tasks = len(prediction_timestamps)
+        n_inputs = len(prepared)
         n_variates = len(target)
 
-        series_ids = list(prediction_timestamps.keys())
-        future_ts = list(prediction_timestamps.values())
+        # Predictions are ordered (item, target, step); `future` has prediction_length rows per item.
+        # Repeat each item's block of rows once per target column so the two line up.
+        item_rows = np.arange(len(future)).reshape(n_inputs, prediction_length)
+        result = future.iloc[np.repeat(item_rows, n_variates, axis=0).ravel()].reset_index(drop=True)
+        result["target_name"] = np.tile(np.repeat(target, prediction_length), n_inputs)
+        result["predictions"] = mean_np.ravel()
 
-        data = {
-            id_column: np.repeat(series_ids, n_variates * prediction_length),
-            timestamp_column: np.concatenate([np.tile(ts, n_variates) for ts in future_ts]),
-            "target_name": np.tile(np.repeat(target, prediction_length), n_tasks),
-            "predictions": mean_np.ravel(),
-        }
-
-        quantiles_flat = quantiles_np.reshape(-1, len(quantile_levels))
+        quantiles_flat = quantiles_np.reshape(len(result), len(quantile_levels))
         for q_idx, q_level in enumerate(quantile_levels):
-            data[str(q_level)] = quantiles_flat[:, q_idx]
+            result[str(q_level)] = quantiles_flat[:, q_idx]
 
-        predictions_df = pd.DataFrame(data)
-        # If validate_inputs=False, the df is used as-is without sorting by item_id, no reordering required
-        if validate_inputs:
-            predictions_df.set_index(id_column, inplace=True)
-            predictions_df = predictions_df.loc[original_order]
-            predictions_df.reset_index(inplace=True)
-
-        return predictions_df
-
-    def _predict_fev_window(
-        self,
-        window: "fev.EvaluationWindow",
-        quantile_levels: list[float],
-        batch_size: int,
-        as_univariate: bool,
-        **predict_kwargs,
-    ) -> tuple["datasets.DatasetDict", float]:
-        import datasets
-        import fev
-
-        from chronos.chronos2.dataset import convert_fev_window_to_list_of_dicts_input
-
-        inputs, target_columns, past_dynamic_columns, known_dynamic_columns = (
-            convert_fev_window_to_list_of_dicts_input(window=window, as_univariate=as_univariate)
-        )
-
-        num_variates: int = len(target_columns) + len(past_dynamic_columns) + len(known_dynamic_columns)
-        if batch_size < num_variates:
-            warnings.warn(
-                f"batch_size ({batch_size}) is smaller than num_variates ({num_variates}) in the task. "
-                f"Setting batch_size = num_variates = num_targets + num_covariates",
-                category=UserWarning,
-                stacklevel=3,
-            )
-            batch_size = num_variates
-
-        start_time = time.monotonic()
-
-        quantiles, mean = self.predict_quantiles(
-            inputs=inputs,
-            prediction_length=window.horizon,
-            quantile_levels=quantile_levels,
-            limit_prediction_length=False,
-            batch_size=batch_size,
-            **predict_kwargs,
-        )
-        # since fev tasks are homogenous, we can safely stack the list of tensors into a single tensor
-        quantiles_np = torch.stack(quantiles).numpy()  # [n_tasks, n_variates, horizon, num_quantiles]
-        mean_np = torch.stack(mean).numpy()  # [n_tasks, n_variates, horizon]
-
-        inference_time_s = time.monotonic() - start_time
-
-        multivariate_forecast: dict[str, dict[str, np.ndarray]] = {variate_name: {} for variate_name in target_columns}
-        # mean_np is actually the median here
-        point_forecast = mean_np  # [num_items, n_variates, horizon]
-
-        for v_idx, variate_name in enumerate(target_columns):
-            multivariate_forecast[variate_name]["predictions"] = point_forecast[:, v_idx]
-
-        for q_idx, level in enumerate(quantile_levels):
-            for v_idx, variate_name in enumerate(target_columns):
-                multivariate_forecast[variate_name][str(level)] = quantiles_np[:, v_idx, :, q_idx]
-
-        predictions_dict: dict = {}
-        for variate_name in target_columns:
-            predictions_dict[variate_name] = datasets.Dataset.from_dict(
-                {
-                    k: multivariate_forecast[variate_name][k]
-                    for k in ["predictions"] + [str(q) for q in quantile_levels]
-                }
-            )
-        predictions = datasets.DatasetDict(predictions_dict)
-        predictions.set_format("numpy")
-
-        if as_univariate:
-            predictions = fev.utils.combine_univariate_predictions_to_multivariate(predictions, window.target_columns)
-
-        return predictions, inference_time_s
+        return result
 
     def predict_fev(
         self,
@@ -1050,30 +993,39 @@ class Chronos2Pipeline(BaseChronosPipeline):
         inference_time_s
             Total time that it took to make predictions for all windows (in seconds)
         """
-        from chronos.chronos2.dataset import convert_fev_window_to_list_of_dicts_input
-
         try:
             import fev
         except ImportError:
             raise ImportError("fev is required for predict_fev. Please install it with `pip install fev`.")
 
+        # The number of variates per task is the same across all windows, so we check it once here.
+        # Covariates are ignored when `as_univariate=True`, so each task then has a single variate.
+        if as_univariate:
+            num_variates = 1
+        else:
+            num_variates = len(task.target_columns) + len(task.past_dynamic_columns) + len(task.known_dynamic_columns)
+        if batch_size < num_variates:
+            warnings.warn(
+                f"batch_size ({batch_size}) is smaller than num_variates ({num_variates}) in the task. "
+                f"Setting batch_size = num_variates = num_targets + num_covariates",
+                category=UserWarning,
+                stacklevel=2,
+            )
+            batch_size = num_variates
+
         pipeline = self
         if finetune_kwargs is not None:
             # only fine-tune the model on the first window
             first_window = task.get_window(0)
-            inputs, target_columns, past_dynamic_columns, known_dynamic_columns = (
-                convert_fev_window_to_list_of_dicts_input(window=first_window, as_univariate=as_univariate)
+            past_df, future_df, target_columns = self._fev_window_to_df(first_window, as_univariate=as_univariate)
+            inputs = from_data_frame(
+                past_df,
+                target_columns=target_columns,
+                prediction_length=first_window.horizon,
+                future_df=future_df,
+                id_column=first_window.id_column,
+                timestamp_column=first_window.timestamp_column,
             )
-
-            num_variates: int = len(target_columns) + len(past_dynamic_columns) + len(known_dynamic_columns)
-            if batch_size < num_variates:
-                warnings.warn(
-                    f"batch_size ({batch_size}) is smaller than num_variates ({num_variates}) in the task. "
-                    f"Setting batch_size = num_variates = num_targets + num_covariates",
-                    category=UserWarning,
-                    stacklevel=2,
-                )
-                batch_size = num_variates
 
             finetune_kwargs = deepcopy(finetune_kwargs)
             finetune_kwargs["prediction_length"] = first_window.horizon
@@ -1084,15 +1036,30 @@ class Chronos2Pipeline(BaseChronosPipeline):
         predictions_per_window = []
         inference_time_s = 0.0
         for window in task.iter_windows():
-            predictions, window_inference_time_s = pipeline._predict_fev_window(
-                window,
+            past_df, future_df, target_columns = self._fev_window_to_df(window, as_univariate=as_univariate)
+
+            start_time = time.monotonic()
+            forecast_df = pipeline.predict_df(
+                past_df,
+                future_df=future_df,
+                id_column=window.id_column,
+                timestamp_column=window.timestamp_column,
+                target=target_columns,
+                prediction_length=window.horizon,
                 quantile_levels=task.quantile_levels,
                 batch_size=batch_size,
-                as_univariate=as_univariate,
                 **kwargs,
             )
-            predictions_per_window.append(predictions)
-            inference_time_s += window_inference_time_s
+            inference_time_s += time.monotonic() - start_time
+
+            predictions_per_window.append(
+                fev.utils.convert_forecast_df_to_predictions(
+                    forecast_df,
+                    horizon=window.horizon,
+                    quantile_levels=task.quantile_levels,
+                    target_columns=window.target_columns,
+                )
+            )
 
         return predictions_per_window, inference_time_s
 
@@ -1136,8 +1103,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
             )
             context_length = self.model_context_length
 
-        test_dataset = Chronos2Dataset.convert_inputs(
-            inputs=inputs,
+        test_dataset = Chronos2Dataset(
+            inputs,
             context_length=context_length,
             prediction_length=0,
             batch_size=batch_size,
@@ -1196,6 +1163,14 @@ class Chronos2Pipeline(BaseChronosPipeline):
                     f"Please install `peft` with `pip install peft` to use this model. "
                 )
             from peft import AutoPeftModel
+
+            # Allow importing the adapter's parent library from our own package.
+            # See https://github.com/huggingface/peft/pull/3090.
+            # The version guard can be dropped once min `peft` is 0.20.
+            from peft import __version__ as peft_version
+
+            if version.parse(peft_version) >= version.parse("0.20.0"):
+                kwargs.setdefault("import_allowlist", ["chronos"])
 
             model = AutoPeftModel.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
             model = model.merge_and_unload()

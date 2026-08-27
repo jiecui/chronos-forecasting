@@ -14,8 +14,11 @@ import torch
 
 from chronos import BaseChronosPipeline, Chronos2Pipeline
 from chronos.chronos2.config import Chronos2CoreConfig
+from chronos.chronos2.dataset import MAX_REJECTED_SAMPLES, Chronos2Dataset, DatasetMode
 from chronos.chronos2.layers import MHA
-from chronos.df_utils import convert_df_input_to_list_of_dicts_input
+from chronos.chronos2.model import Chronos2Encoder
+from chronos.chronos2.preprocess import from_data_frame
+from chronos.df_utils import make_future_df, normalize_df
 from test.util import create_df, create_future_df, get_forecast_start_times, validate_tensor, timeout_callback
 
 DUMMY_MODEL_PATH = Path(__file__).parent / "dummy-chronos2-model"
@@ -28,6 +31,17 @@ with open(DUMMY_MODEL_PATH / "config.json") as fp:
 @pytest.fixture
 def pipeline() -> Chronos2Pipeline:
     return BaseChronosPipeline.from_pretrained(DUMMY_MODEL_PATH, device_map="cpu")
+
+
+def test_chronos2_encoder_accepts_config_without_is_decoder():
+    config = Chronos2CoreConfig(d_model=32, d_kv=8, d_ff=32, num_layers=2, num_heads=4)
+
+    if hasattr(config, "is_decoder"):
+        del config.is_decoder
+
+    encoder = Chronos2Encoder(config)
+
+    assert len(encoder.block) == config.num_layers
 
 
 def test_base_chronos2_pipeline_loads_from_s3():
@@ -103,15 +117,9 @@ def test_chronos2_lora_pipeline_loads_from_disk():
             15,
             [(1, DEFAULT_MODEL_NUM_QUANTILES, 15)] * 3,
         ),
-        # Heterogenous list of dicts with different mix of tasks
+        # Homogenous list of dicts with categorical covariates and known-future values
         (
             [
-                {
-                    "target": torch.rand(100),
-                    "past_covariates": {"temperature": torch.rand(100), "precipitation": torch.rand(100)},
-                    "future_covariates": {"temperature": torch.rand(200)},
-                },
-                {"target": torch.rand(2, 150), "past_covariates": {"wind_speed": torch.rand(150)}},
                 {
                     "target": np.random.rand(150),
                     "past_covariates": {
@@ -125,7 +133,7 @@ def test_chronos2_lora_pipeline_loads_from_disk():
                     },
                 },
                 {
-                    "target": np.random.rand(3, 150),
+                    "target": np.random.rand(150),
                     "past_covariates": {
                         "numeric_covariate_1": np.random.rand(150),
                         "numeric_covariate_2": np.random.rand(150),
@@ -136,16 +144,9 @@ def test_chronos2_lora_pipeline_loads_from_disk():
                         "cat_covariate": np.random.choice(["A", "B", "C", "D", "E"], size=200),
                     },
                 },
-                {"target": torch.rand(1, 150)},
             ],
             200,
-            [
-                (1, DEFAULT_MODEL_NUM_QUANTILES, 200),
-                (2, DEFAULT_MODEL_NUM_QUANTILES, 200),
-                (1, DEFAULT_MODEL_NUM_QUANTILES, 200),
-                (3, DEFAULT_MODEL_NUM_QUANTILES, 200),
-                (1, DEFAULT_MODEL_NUM_QUANTILES, 200),
-            ],
+            [(1, DEFAULT_MODEL_NUM_QUANTILES, 200)] * 2,
         ),
     ],
 )
@@ -219,15 +220,9 @@ def test_when_input_is_valid_then_pipeline_can_predict(pipeline, inputs, predict
             [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99],
             [(1, 15, 13)] * 3,
         ),
-        # Heterogenous list of dicts with different mix of tasks
+        # Homogenous list of dicts with categorical covariates and known-future values
         (
             [
-                {
-                    "target": torch.rand(100),
-                    "past_covariates": {"temperature": torch.rand(100), "precipitation": torch.rand(100)},
-                    "future_covariates": {"temperature": torch.rand(200)},
-                },
-                {"target": torch.rand(2, 150), "past_covariates": {"wind_speed": torch.rand(150)}},
                 {
                     "target": np.random.rand(150),
                     "past_covariates": {
@@ -241,7 +236,7 @@ def test_when_input_is_valid_then_pipeline_can_predict(pipeline, inputs, predict
                     },
                 },
                 {
-                    "target": np.random.rand(3, 150),
+                    "target": np.random.rand(150),
                     "past_covariates": {
                         "numeric_covariate_1": np.random.rand(150),
                         "numeric_covariate_2": np.random.rand(150),
@@ -252,11 +247,10 @@ def test_when_input_is_valid_then_pipeline_can_predict(pipeline, inputs, predict
                         "cat_covariate": np.random.choice(["A", "B", "C", "D", "E"], size=200),
                     },
                 },
-                {"target": torch.rand(1, 150)},
             ],
             200,
             [0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.99],
-            [(1, 200, 11), (2, 200, 11), (1, 200, 11), (3, 200, 11), (1, 200, 11)],
+            [(1, 200, 11)] * 2,
         ),
     ],
 )
@@ -277,11 +271,11 @@ def test_when_input_is_valid_then_pipeline_can_predict_quantiles(
 @pytest.mark.parametrize(
     "inputs, error_match_string",
     [
-        (torch.rand(16), "should be 3-d with shape"),
-        (torch.rand(4, 3), "should be 3-d with shape"),
-        ([torch.rand(1, 2, 100), torch.rand(120)], "the elements should either be 1-d"),
+        (torch.rand(16), "Expected 3-d tensor with shape"),
+        (torch.rand(4, 3), "Expected 3-d tensor with shape"),
+        ([torch.rand(1, 2, 100), torch.rand(120)], "Each element should be 1-d"),
         ([{"target": torch.rand(10)}, {"target": torch.rand(1, 2, 17), "extra_key": []}], "Found invalid keys"),
-        ([{"target": torch.rand(10)}, {"target": torch.rand(1, 2, 17)}], "`target` should either be 1-d with shape"),
+        ([{"target": torch.rand(10)}, {"target": torch.rand(1, 2, 17)}], "Target must be 1-d or 2-d"),
         ([{"target": torch.rand(10), "past_covariates": torch.rand(10)}], "Found invalid type for `past_covariates`"),
         (
             [
@@ -487,8 +481,8 @@ def test_predict_df_works_for_valid_inputs(
     [
         # Missing timestamp column
         ({"item_id": ["A"], "target": [1.0]}, "df does not contain all"),
-        # Insufficient data points
-        ({"item_id": ["A"], "timestamp": ["2023-01-01"], "target": [1.0]}, "must have at least 3 data"),
+        # Too few points to infer a frequency, and no explicit freq provided
+        ({"item_id": ["A"], "timestamp": ["2023-01-01"], "target": [1.0]}, "Could not infer frequency"),
     ],
 )
 def test_predict_df_df_validation_errors(pipeline, context_data, error_match):
@@ -496,6 +490,22 @@ def test_predict_df_df_validation_errors(pipeline, context_data, error_match):
 
     with pytest.raises(ValueError, match=error_match):
         pipeline.predict_df(df)
+
+
+def test_predict_df_accepts_short_series_with_explicit_freq(pipeline):
+    """Series with fewer than 3 points are allowed as long as the frequency can be determined."""
+    df = pd.DataFrame(
+        {
+            "item_id": ["A", "A", "B"],
+            "timestamp": ["2023-01-01", "2023-01-02", "2023-01-01"],
+            "target": [1.0, 2.0, 3.0],
+        }
+    )
+
+    result = pipeline.predict_df(df, prediction_length=2, freq="D", validate_inputs=False)
+
+    assert set(result["item_id"]) == {"A", "B"}
+    assert len(result) == 2 * 2  # two items, prediction_length=2
 
 
 @pytest.mark.parametrize(
@@ -597,6 +607,75 @@ def test_predict_df_with_future_df_with_different_lengths_raises_error(pipeline)
         pipeline.predict_df(df, future_df=future_df, prediction_length=3)
 
 
+def test_predict_df_matches_manual_preprocess_path(pipeline):
+    """predict_df must produce the same output as manually preprocessing the df with
+    from_data_frame + make_future_df and assembling the result (multi-target, numeric +
+    categorical covariates)."""
+    freq = "h"
+    prediction_length = 4
+    quantile_levels = [0.1, 0.5, 0.9]
+    target_columns = ["sales", "revenue"]
+
+    df = create_df(
+        series_ids=["B", "A", "C"],
+        n_points=[12, 20, 15],
+        target_cols=target_columns,
+        covariates=["temp", "promo"],  # temp: past+future numeric; promo: past-only
+        freq=freq,
+    )
+    # Make `promo` categorical (numpy str), exercising the categorical encoding path.
+    rng = np.random.RandomState(0)
+    df["promo"] = rng.choice(["lo", "hi"], size=len(df))
+
+    forecast_start_times = get_forecast_start_times(df, freq)
+    future_df = create_future_df(
+        forecast_start_times,
+        series_ids=["B", "A", "C"],
+        n_points=[prediction_length] * 3,
+        covariates=["temp"],
+        freq=freq,
+    )
+
+    result = pipeline.predict_df(
+        df,
+        future_df=future_df,
+        target=target_columns,
+        prediction_length=prediction_length,
+        quantile_levels=quantile_levels,
+    )
+
+    # Reconstruct the expected output manually via the public preprocessing helpers.
+    inputs = from_data_frame(
+        df=df,
+        future_df=future_df,
+        target_columns=target_columns,
+        prediction_length=prediction_length,
+    )
+    quantiles, mean = pipeline.predict_quantiles(
+        inputs=inputs,
+        prediction_length=prediction_length,
+        quantile_levels=quantile_levels,
+        limit_prediction_length=False,
+    )
+    quantiles_np = torch.stack(quantiles).numpy()
+    mean_np = torch.stack(mean).numpy()
+
+    n_inputs = len(inputs)
+    n_variates = len(target_columns)
+    # Both from_data_frame and make_future_df work on the normalized (first-appearance order) df.
+    future = make_future_df(normalize_df(df), prediction_length, freq=freq)
+    # `future` has prediction_length rows per item; repeat each item's block once per target column.
+    item_rows = np.arange(len(future)).reshape(n_inputs, prediction_length)
+    expected = future.iloc[np.repeat(item_rows, n_variates, axis=0).ravel()].reset_index(drop=True)
+    expected["target_name"] = np.tile(np.repeat(target_columns, prediction_length), n_inputs)
+    expected["predictions"] = mean_np.ravel()
+    quantiles_flat = quantiles_np.reshape(-1, len(quantile_levels))
+    for q_idx, q_level in enumerate(quantile_levels):
+        expected[str(q_level)] = quantiles_flat[:, q_idx]
+
+    pd.testing.assert_frame_equal(result, expected)
+
+
 @pytest.mark.parametrize(
     "context_setup, future_setup",
     [
@@ -690,21 +769,15 @@ def test_predict_df_outputs_different_results_with_cross_learning_enabled(
             15,
             [(1, DEFAULT_MODEL_NUM_QUANTILES, 15)] * 3,
         ),
-        # Heterogenous list of dicts with different mix of tasks
+        # Homogenous list of dicts with categorical covariates and known-future values
         (
             [
                 {
-                    "target": torch.rand(1000),
-                    "past_covariates": {"temperature": torch.rand(1000), "precipitation": torch.rand(1000)},
-                    "future_covariates": {"temperature": torch.rand(200)},
-                },
-                {"target": torch.rand(2, 150), "past_covariates": {"wind_speed": torch.rand(150)}},
-                {
-                    "target": np.random.rand(150),
+                    "target": np.random.rand(400),
                     "past_covariates": {
-                        "numeric_covariate_1": np.random.rand(150),
-                        "numeric_covariate_2": np.random.rand(150),
-                        "cat_covariate": np.random.choice(["A", "B", "C", "D", "E"], size=150),
+                        "numeric_covariate_1": np.random.rand(400),
+                        "numeric_covariate_2": np.random.rand(400),
+                        "cat_covariate": np.random.choice(["A", "B", "C", "D", "E"], size=400),
                     },
                     "future_covariates": {
                         "numeric_covariate_1": np.random.rand(200),
@@ -712,27 +785,20 @@ def test_predict_df_outputs_different_results_with_cross_learning_enabled(
                     },
                 },
                 {
-                    "target": np.random.rand(3, 150),
+                    "target": np.random.rand(400),
                     "past_covariates": {
-                        "numeric_covariate_1": np.random.rand(150),
-                        "numeric_covariate_2": np.random.rand(150),
-                        "cat_covariate": np.random.choice(["A", "B", "C", "D", "E"], size=150),
+                        "numeric_covariate_1": np.random.rand(400),
+                        "numeric_covariate_2": np.random.rand(400),
+                        "cat_covariate": np.random.choice(["A", "B", "C", "D", "E"], size=400),
                     },
                     "future_covariates": {
                         "numeric_covariate_1": np.random.rand(200),
                         "cat_covariate": np.random.choice(["A", "B", "C", "D", "E"], size=200),
                     },
                 },
-                {"target": torch.rand(1, 150)},
             ],
             200,
-            [
-                (1, DEFAULT_MODEL_NUM_QUANTILES, 200),
-                (2, DEFAULT_MODEL_NUM_QUANTILES, 200),
-                (1, DEFAULT_MODEL_NUM_QUANTILES, 200),
-                (3, DEFAULT_MODEL_NUM_QUANTILES, 200),
-                (1, DEFAULT_MODEL_NUM_QUANTILES, 200),
-            ],
+            [(1, DEFAULT_MODEL_NUM_QUANTILES, 200)] * 2,
         ),
     ],
 )
@@ -966,8 +1032,8 @@ def test_two_step_finetuning_with_df_input_works(pipeline, context_setup, future
         df, future_df=future_df, target=target_columns, prediction_length=prediction_length
     )
 
-    # Convert df inputs to list of dicts inputs expected by finetune
-    inputs, _, _ = convert_df_input_to_list_of_dicts_input(
+    # Convert df inputs to the preprocessed inputs expected by finetune
+    inputs = from_data_frame(
         df,
         future_df=future_df,
         id_column="item_id",
@@ -1143,3 +1209,117 @@ def test_eager_and_sdpa_produce_identical_outputs(pipeline):
     for out_eager, out_sdpa in zip(outputs_eager_grouped, outputs_sdpa_grouped):
         # Should match exactly or very close (numerical precision)
         assert torch.allclose(out_eager, out_sdpa, atol=1e-5, rtol=1e-4)
+
+
+def test_pipeline_can_be_finetuned_with_preprocessed_hf_dataset(pipeline):
+    """Test that fine-tuning works with preprocessed inputs from a HuggingFace Dataset."""
+    from chronos.chronos2.preprocess import from_list_of_dicts
+
+    prediction_length = 8
+    raw_inputs = [{"target": torch.rand(20)}, {"target": torch.rand(25)}, {"target": torch.rand(30)}]
+
+    # Preprocess and convert to HF Dataset (simulating Arrow-based lazy loading)
+    prepared_tasks = from_list_of_dicts(raw_inputs, prediction_length=prediction_length)
+    hf_dataset = datasets.Dataset.from_list(prepared_tasks).with_format("torch")
+
+    # Fine-tune with preprocessed inputs (auto-detected from the PreparedInput schema)
+    ft_pipeline = pipeline.fit(
+        hf_dataset, prediction_length=prediction_length, num_steps=5, min_past=1, batch_size=32
+    )
+
+    # Verify fine-tuned model can predict
+    ft_outputs = ft_pipeline.predict(raw_inputs, prediction_length=prediction_length)
+    assert len(ft_outputs) == len(raw_inputs)
+    for ft_out in ft_outputs:
+        assert ft_out.shape == (1, DEFAULT_MODEL_NUM_QUANTILES, prediction_length)
+        assert not torch.isnan(ft_out).any()
+
+
+class _CountingSequence:
+    def __init__(self, n_items: int, context_length: int) -> None:
+        self._n_items = n_items
+        self._context_length = context_length
+        self.access_count = 0
+
+    def __len__(self) -> int:
+        return self._n_items
+
+    def __getitem__(self, idx: int) -> dict:
+        if not 0 <= idx < self._n_items:
+            raise IndexError(idx)
+        self.access_count += 1
+        return {
+            "context": torch.rand(1, self._context_length),
+            "future_covariates": torch.zeros(1, 0),
+            "n_targets": 1,
+            "n_covariates": 0,
+            "n_future_covariates": 0,
+        }
+
+
+def test_train_dataset_does_not_materialize_lazy_inputs():
+    n_items, batch_size, num_steps = 10_000, 4, 5
+    src = _CountingSequence(n_items, context_length=64)
+
+    dataset = Chronos2Dataset(
+        inputs=src,
+        context_length=512,
+        prediction_length=8,
+        batch_size=batch_size,
+        output_patch_size=16,
+        mode=DatasetMode.TRAIN,
+    )
+
+    it = iter(dataset)
+    for _ in range(num_steps):
+        next(it)
+
+    assert src.access_count <= 5 * num_steps * batch_size
+
+
+def test_train_dataset_raises_when_all_lazy_inputs_too_short():
+    prediction_length, min_past = 8, 4
+    src = _CountingSequence(16, context_length=min_past + prediction_length - 1)
+
+    dataset = Chronos2Dataset(
+        inputs=src,
+        context_length=512,
+        prediction_length=prediction_length,
+        batch_size=4,
+        output_patch_size=16,
+        min_past=min_past,
+        mode=DatasetMode.TRAIN,
+    )
+
+    src.access_count = 0
+    with pytest.raises(ValueError, match="at least"):
+        next(iter(dataset))
+
+    assert src.access_count == MAX_REJECTED_SAMPLES
+
+
+def test_validation_dataset_filters_too_short_preprocessed_inputs():
+    prediction_length, min_past = 8, 4
+    inputs = [
+        {"context": torch.rand(1, 64), "future_covariates": torch.zeros(1, 0),
+         "n_targets": 1, "n_covariates": 0, "n_future_covariates": 0},
+        {"context": torch.rand(1, min_past + prediction_length - 1), "future_covariates": torch.zeros(1, 0),
+         "n_targets": 1, "n_covariates": 0, "n_future_covariates": 0},
+        {"context": torch.rand(1, 64), "future_covariates": torch.zeros(1, 0),
+         "n_targets": 1, "n_covariates": 0, "n_future_covariates": 0},
+    ]
+
+    dataset = Chronos2Dataset(
+        inputs=inputs,
+        context_length=512,
+        prediction_length=prediction_length,
+        batch_size=1,
+        output_patch_size=16,
+        min_past=min_past,
+        mode=DatasetMode.VALIDATION,
+    )
+
+    batches = list(dataset)
+    assert len(batches) == 2
+    for batch in batches:
+        assert batch["future_target"].shape[-1] == prediction_length
