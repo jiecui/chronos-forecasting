@@ -47,10 +47,13 @@ import os
 
 # Use only 1 GPU if available
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# Set HF token in the environment. Do not hardcode it in production for security reasons.
+# export HF_TOKEN="your_hf_token_here"
 
-import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
 from chronos import BaseChronosPipeline, Chronos2Pipeline
 
 # Load the Chronos-2 pipeline GPU recommended for faster inference, but CPU
@@ -59,9 +62,7 @@ from chronos import BaseChronosPipeline, Chronos2Pipeline
 # Note: Cannot use Windows symlinks, use "s3://autogluon/chronos-2/" for
 # windows. "amazon/chronos-2" for linux WSL users should point python to
 # system certificates (see .zshrc)
-pipeline: Chronos2Pipeline = BaseChronosPipeline.from_pretrained(
-    "amazon/chronos-2", device_map="cuda"
-)
+pipeline: Chronos2Pipeline = BaseChronosPipeline.from_pretrained("amazon/chronos-2", device_map="cuda")
 
 # %% [markdown]
 # ## Univariate Forecasting
@@ -70,16 +71,12 @@ pipeline: Chronos2Pipeline = BaseChronosPipeline.from_pretrained(
 
 # %%
 # Load data as a long-format pandas data frame
-context_df = pd.read_csv(
-    "https://autogluon.s3.amazonaws.com/datasets/timeseries/m4_hourly/train.csv"
-)
+context_df = pd.read_csv("https://autogluon.s3.amazonaws.com/datasets/timeseries/m4_hourly/train.csv")
 print("Input dataframe shape:", context_df.shape)
 display(context_df.head())
 
 # %%
-pred_df = pipeline.predict_df(
-    context_df, prediction_length=24, quantile_levels=[0.1, 0.5, 0.9]
-)
+pred_df = pipeline.predict_df(context_df, prediction_length=24, quantile_levels=[0.1, 0.5, 0.9])
 
 print("Output dataframe shape:", pred_df.shape)
 display(pred_df.head())
@@ -118,9 +115,7 @@ timeseries_id = "DE"  # Specific time series to visualize (Germany)
 energy_context_df = pd.read_parquet(
     "https://autogluon.s3.amazonaws.com/datasets/timeseries/electricity_price/train.parquet"
 )
-energy_context_df[timestamp_column] = pd.to_datetime(
-    energy_context_df[timestamp_column]
-)
+energy_context_df[timestamp_column] = pd.to_datetime(energy_context_df[timestamp_column])
 print("Energy context dataframe shape:", energy_context_df.shape)
 display(energy_context_df.head())
 
@@ -165,15 +160,11 @@ def plot_forecast(
     history_length: int = 256,
     title_suffix: str = "",
 ):
-    ts_context = context_df.query(f"{id_column} == @timeseries_id").set_index(
+    ts_context = context_df.query(f"{id_column} == @timeseries_id").set_index(timestamp_column)[target_column]
+    ts_pred = pred_df.query(f"{id_column} == @timeseries_id and target_name == @target_column").set_index(
         timestamp_column
-    )[target_column]
-    ts_pred = pred_df.query(
-        f"{id_column} == @timeseries_id and target_name == @target_column"
-    ).set_index(timestamp_column)[["0.1", "predictions", "0.9"]]
-    ts_ground_truth = test_df.query(f"{id_column} == @timeseries_id").set_index(
-        timestamp_column
-    )[target_column]
+    )[["0.1", "predictions", "0.9"]]
+    ts_ground_truth = test_df.query(f"{id_column} == @timeseries_id").set_index(timestamp_column)[target_column]
 
     last_date = ts_context.index.max()
     start_idx = max(0, len(ts_context) - history_length)
@@ -185,9 +176,7 @@ def plot_forecast(
     fig = plt.figure(figsize=(12, 3))
     ax = fig.gca()
     ts_context.plot(ax=ax, label=f"historical {target_column}", color="xkcd:azure")
-    ts_ground_truth.plot(
-        ax=ax, label=f"future {target_column} (ground truth)", color="xkcd:grass green"
-    )
+    ts_ground_truth.plot(ax=ax, label=f"future {target_column} (ground truth)", color="xkcd:grass green")
     ts_pred["predictions"].plot(ax=ax, label="forecast", color="xkcd:violet")
     ax.fill_between(
         ts_pred.index,
@@ -251,9 +240,7 @@ timestamp_column = "timestamp"  # Column containing datetime information
 timeseries_id = "1"  # Specific time series to visualize (product/store ID)
 
 # Load historical sales and past values of covariates
-sales_context_df = pd.read_parquet(
-    "https://autogluon.s3.amazonaws.com/datasets/timeseries/retail_sales/train.parquet"
-)
+sales_context_df = pd.read_parquet("https://autogluon.s3.amazonaws.com/datasets/timeseries/retail_sales/train.parquet")
 sales_context_df[timestamp_column] = pd.to_datetime(sales_context_df[timestamp_column])
 print(
     "The number of unique time series (products/stores) in the sales context dataframe is:",
@@ -263,9 +250,7 @@ print("Sales context dataframe shape:", sales_context_df.shape)
 display(sales_context_df.head())
 
 # Load future values of covariates
-sales_test_df = pd.read_parquet(
-    "https://autogluon.s3.amazonaws.com/datasets/timeseries/retail_sales/test.parquet"
-)
+sales_test_df = pd.read_parquet("https://autogluon.s3.amazonaws.com/datasets/timeseries/retail_sales/test.parquet")
 sales_test_df[timestamp_column] = pd.to_datetime(sales_test_df[timestamp_column])
 print("Sales test dataframe shape:", sales_test_df.shape)
 display(sales_test_df.head())
@@ -377,17 +362,13 @@ joint_pred_df = pipeline.predict_df(
 # %%
 # Univariate forecasting
 inputs = np.random.randn(32, 1, 100)
-quantiles, mean = pipeline.predict_quantiles(
-    inputs, prediction_length=24, quantile_levels=[0.1, 0.5, 0.9]
-)
+quantiles, mean = pipeline.predict_quantiles(inputs, prediction_length=24, quantile_levels=[0.1, 0.5, 0.9])
 print("Univariate output shapes:", quantiles[0].shape, mean[0].shape)
 
 # %%
 # Multivariate forecasting
 inputs = np.random.randn(32, 3, 512)
-quantiles, mean = pipeline.predict_quantiles(
-    inputs, prediction_length=48, quantile_levels=[0.1, 0.5, 0.9]
-)
+quantiles, mean = pipeline.predict_quantiles(inputs, prediction_length=48, quantile_levels=[0.1, 0.5, 0.9])
 print("Multivariate output shapes:", quantiles[0].shape, mean[0].shape)
 
 # %%
@@ -421,9 +402,7 @@ inputs = [
         },
         "future_covariates": {
             "temperature": np.random.randn(prediction_length),
-            "weather_type": np.random.choice(
-                ["sunny", "cloudy", "rainy"], size=prediction_length
-            ),
+            "weather_type": np.random.choice(["sunny", "cloudy", "rainy"], size=prediction_length),
         },
     }
     for _ in range(10)

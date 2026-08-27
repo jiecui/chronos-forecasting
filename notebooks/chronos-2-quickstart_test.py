@@ -1,15 +1,32 @@
-# Test Chronos-2 time series forecasting
+# ---
+# jupyter:
+#   jupytext:
+#     cell_metadata_filter: -all
+#     formats: ipynb,py:percent
+#     text_representation:
+#       extension: .py
+#       format_name: percent
+#       format_version: '1.3'
+#       jupytext_version: 1.19.1
+# ---
 
+# %% [markdown]
+# # Test Chronos-2 time series forecasting
+
+# %%
 # ==========================================================================
 # Import libraries
 # ==========================================================================
 import os
-import pandas as pd
-import numpy as np
+
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
 from chronos import BaseChronosPipeline, Chronos2Pipeline
 
 
+# %%
 # ==========================================================================
 # Define functions
 # ==========================================================================
@@ -25,15 +42,11 @@ def plot_forecast(
     history_length: int = 256,
     title_suffix: str = "",
 ):
-    ts_context = context_df.query(f"{id_column} == @timeseries_id").set_index(
+    ts_context = context_df.query(f"{id_column} == @timeseries_id").set_index(timestamp_column)[target_column]
+    ts_pred = pred_df.query(f"{id_column} == @timeseries_id and target_name == @target_column").set_index(
         timestamp_column
-    )[target_column]
-    ts_pred = pred_df.query(
-        f"{id_column} == @timeseries_id and target_name == @target_column"
-    ).set_index(timestamp_column)[["0.1", "predictions", "0.9"]]
-    ts_ground_truth = test_df.query(f"{id_column} == @timeseries_id").set_index(
-        timestamp_column
-    )[target_column]
+    )[["0.1", "predictions", "0.9"]]
+    ts_ground_truth = test_df.query(f"{id_column} == @timeseries_id").set_index(timestamp_column)[target_column]
 
     last_date = ts_context.index.max()
     start_idx = max(0, len(ts_context) - history_length)
@@ -45,9 +58,7 @@ def plot_forecast(
     fig = plt.figure(figsize=(12, 3))
     ax = fig.gca()
     ts_context.plot(ax=ax, label=f"historical {target_column}", color="xkcd:azure")
-    ts_ground_truth.plot(
-        ax=ax, label=f"future {target_column} (ground truth)", color="xkcd:grass green"
-    )
+    ts_ground_truth.plot(ax=ax, label=f"future {target_column} (ground truth)", color="xkcd:grass green")
     ts_pred["predictions"].plot(ax=ax, label="forecast", color="xkcd:violet")
     ax.fill_between(
         ts_pred.index,
@@ -67,6 +78,7 @@ def plot_forecast(
     )
 
 
+# %%
 def retail_demand_forecasting(pipeline: Chronos2Pipeline):
 
     print("=== Running retail demand forecasting ===")
@@ -82,9 +94,7 @@ def retail_demand_forecasting(pipeline: Chronos2Pipeline):
     sales_context_df = pd.read_parquet(
         "https://autogluon.s3.amazonaws.com/datasets/timeseries/retail_sales/train.parquet"
     )
-    sales_context_df[timestamp_column] = pd.to_datetime(
-        sales_context_df[timestamp_column]
-    )
+    sales_context_df[timestamp_column] = pd.to_datetime(sales_context_df[timestamp_column])
     print(
         "The number of unique time series (products/stores) in the sales context dataframe is:",
         sales_context_df[id_column].nunique(),
@@ -93,9 +103,7 @@ def retail_demand_forecasting(pipeline: Chronos2Pipeline):
     print(sales_context_df.head())
 
     # Load future values of covariates
-    sales_test_df = pd.read_parquet(
-        "https://autogluon.s3.amazonaws.com/datasets/timeseries/retail_sales/test.parquet"
-    )
+    sales_test_df = pd.read_parquet("https://autogluon.s3.amazonaws.com/datasets/timeseries/retail_sales/test.parquet")
     sales_test_df[timestamp_column] = pd.to_datetime(sales_test_df[timestamp_column])
     print("Sales test dataframe shape:", sales_test_df.shape)
     print(sales_test_df.head())
@@ -159,9 +167,7 @@ def retail_demand_forecasting(pipeline: Chronos2Pipeline):
         train_inputs.append(
             {
                 "target": group[target].values,
-                "past_covariates": {
-                    col: group[col].values for col in past_covariates + known_covariates
-                },
+                "past_covariates": {col: group[col].values for col in past_covariates + known_covariates},
                 # Future values of covariates are not used during training.
                 # However, we need to include their names to indicate that these columns will be available at prediction time
                 "future_covariates": {col: None for col in known_covariates},
@@ -233,23 +239,20 @@ def retail_demand_forecasting(pipeline: Chronos2Pipeline):
     )
 
 
+# %%
 def m4_dataset_forecasting(pipeline: Chronos2Pipeline) -> pd.DataFrame:
 
     print("=== Running M4 dataset forecasting ===")
 
     # Load data as a long-format pandas data frame
     # --------------------------------------------
-    context_df = pd.read_csv(
-        "https://autogluon.s3.amazonaws.com/datasets/timeseries/m4_hourly/train.csv"
-    )
+    context_df = pd.read_csv("https://autogluon.s3.amazonaws.com/datasets/timeseries/m4_hourly/train.csv")
     print("Input dataframe shape:", context_df.shape)
     print(context_df.head())
 
     # predict
     # -------
-    pred_df = pipeline.predict_df(
-        context_df, prediction_length=24, quantile_levels=[0.1, 0.5, 0.9]
-    )
+    pred_df = pipeline.predict_df(context_df, prediction_length=24, quantile_levels=[0.1, 0.5, 0.9])
 
     print("Output dataframe shape:", pred_df.shape)
     print(pred_df.head())
@@ -257,6 +260,7 @@ def m4_dataset_forecasting(pipeline: Chronos2Pipeline) -> pd.DataFrame:
     return context_df
 
 
+# %%
 def energy_price_forecasting(pipeline: Chronos2Pipeline):
 
     print("=== Running energy price forecasting ===")
@@ -274,9 +278,7 @@ def energy_price_forecasting(pipeline: Chronos2Pipeline):
     energy_context_df = pd.read_parquet(
         "https://autogluon.s3.amazonaws.com/datasets/timeseries/electricity_price/train.parquet"
     )
-    energy_context_df[timestamp_column] = pd.to_datetime(
-        energy_context_df[timestamp_column]
-    )
+    energy_context_df[timestamp_column] = pd.to_datetime(energy_context_df[timestamp_column])
     print("Energy context dataframe shape:", energy_context_df.shape)
     print(energy_context_df.head())
 
@@ -342,6 +344,7 @@ def energy_price_forecasting(pipeline: Chronos2Pipeline):
     )
 
 
+# %%
 def cross_learning_covariates_api(pipeline: Chronos2Pipeline, context_df: pd.DataFrame):
 
     print("=== Running cross-learning covariates API test ===")
@@ -363,16 +366,12 @@ def cross_learning_covariates_api(pipeline: Chronos2Pipeline, context_df: pd.Dat
     # ------------------------
     # Univariate forecasting
     inputs = np.random.randn(32, 1, 100)
-    quantiles, mean = pipeline.predict_quantiles(
-        inputs, prediction_length=24, quantile_levels=[0.1, 0.5, 0.9]
-    )
+    quantiles, mean = pipeline.predict_quantiles(inputs, prediction_length=24, quantile_levels=[0.1, 0.5, 0.9])
     print("Univariate output shapes:", quantiles[0].shape, mean[0].shape)
 
     # Multivariate forecasting
     inputs = np.random.randn(32, 3, 512)
-    quantiles, mean = pipeline.predict_quantiles(
-        inputs, prediction_length=48, quantile_levels=[0.1, 0.5, 0.9]
-    )
+    quantiles, mean = pipeline.predict_quantiles(inputs, prediction_length=48, quantile_levels=[0.1, 0.5, 0.9])
     print("Multivariate output shapes:", quantiles[0].shape, mean[0].shape)
 
     # Univariate forecasting with covariates
@@ -391,9 +390,7 @@ def cross_learning_covariates_api(pipeline: Chronos2Pipeline, context_df: pd.Dat
     quantiles, mean = pipeline.predict_quantiles(
         inputs, prediction_length=prediction_length, quantile_levels=[0.1, 0.5, 0.9]
     )
-    print(
-        "Univariate with covariates output shapes:", quantiles[0].shape, mean[0].shape
-    )
+    print("Univariate with covariates output shapes:", quantiles[0].shape, mean[0].shape)
 
     # Multivariate forecasting with categorical covariates
     prediction_length = 96
@@ -402,15 +399,11 @@ def cross_learning_covariates_api(pipeline: Chronos2Pipeline, context_df: pd.Dat
             "target": np.random.randn(2, 1000),
             "past_covariates": {
                 "temperature": np.random.randn(1000),
-                "weather_type": np.random.choice(
-                    ["sunny", "cloudy", "rainy"], size=1000
-                ),
+                "weather_type": np.random.choice(["sunny", "cloudy", "rainy"], size=1000),
             },
             "future_covariates": {
                 "temperature": np.random.randn(prediction_length),
-                "weather_type": np.random.choice(
-                    ["sunny", "cloudy", "rainy"], size=prediction_length
-                ),
+                "weather_type": np.random.choice(["sunny", "cloudy", "rainy"], size=prediction_length),
             },
         }
         for _ in range(10)
@@ -425,11 +418,11 @@ def cross_learning_covariates_api(pipeline: Chronos2Pipeline, context_df: pd.Dat
     )
 
 
+# %%
 # ==========================================================================
 # Main
 # ==========================================================================
 if __name__ == "__main__":
-
     # Use only 1 GPU if available
     # ---------------------------
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -443,9 +436,7 @@ if __name__ == "__main__":
     # Note: Cannot use Windows symlinks, use "s3://autogluon/chronos-2/" for
     # windows. "amazon/chronos-2" for linux WSL users should point python to
     # system certificates (see .zshrc)
-    pipeline: Chronos2Pipeline = BaseChronosPipeline.from_pretrained(
-        "amazon/chronos-2", device_map="cuda"
-    )
+    pipeline: Chronos2Pipeline = BaseChronosPipeline.from_pretrained("amazon/chronos-2", device_map="cuda")
 
     # Univeriate forecasting on M4 dataset
     # -------------------------------------
@@ -463,4 +454,5 @@ if __name__ == "__main__":
     # ----------------------------------
     cross_learning_covariates_api(pipeline, context_df)
 
+# %% [markdown]
 # [EOF]
