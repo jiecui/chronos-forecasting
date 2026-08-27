@@ -48,7 +48,7 @@ import os
 # Use only 1 GPU if available
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 # Set HF token in the environment. Do not hardcode it in production for security reasons.
-# export HF_TOKEN="your_hf_token_here"
+# # !export HF_TOKEN="your_hf_token_here"
 
 import matplotlib.pyplot as plt
 import numpy as np
