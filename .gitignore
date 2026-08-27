@@ -172,3 +172,6 @@ chronos-2-finetuned
 
 # chronos-forecasting
 figures/
+
+# jupyter notebook
+*.ipynb
